@@ -3,13 +3,16 @@ import os
 import re
 from datetime import datetime, timedelta
 import aiosqlite
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
+from typing import Any, Awaitable, Callable, Dict
 
-# === ЗАГРУЗКА НАСТРОЕК ИЗ .env ===
+# Импортируем aiohttp для создания фейкового веб-сервера для Render
+from aiohttp import web
+
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -21,7 +24,6 @@ if not BOT_TOKEN or not CHANNEL_ID:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 router = Router()
-dp.include_router(router)
 
 # === БАЗА ДАННЫХ ===
 async def init_db():
@@ -40,38 +42,45 @@ async def init_db():
 async def check_sub(user_id: int) -> bool:
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
-        # Пользователь подписан, если он member, admin или creator
         return member.status in ["member", "administrator", "creator"]
     except TelegramBadRequest:
-        # Если бот не админ в канале или канал не существует, вернет False
         return False
 
 def get_sub_keyboard():
-    # Убираем @ для генерации ссылки
     channel_url = CHANNEL_ID.replace("@", "")
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Подписаться на канал", url=f"https://t.me/{channel_url}")],
         [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_sub")]
     ])
 
-# Промежуточный слой (Middleware) для проверки подписки
-@router.message()
-async def force_sub_middleware(message: Message, handler):
-    # Пропускаем команду /start, она обрабатывается отдельно
-    if message.text and message.text.startswith('/start'):
-        return await handler(message)
-        
-    if not await check_sub(message.from_user.id):
-        await message.answer(
-            "🛑 Секретарь работает только для своих.\n"
-            f"Подпишись на канал {CHANNEL_ID}, чтобы получить доступ.",
-            reply_markup=get_sub_keyboard()
-        )
-        return
-    return await handler(message)
+# === ПРАВИЛЬНЫЙ MIDDLEWARE (AIOGRAM 3) ===
+class ForceSubMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
+        event: Message,
+        data: Dict[str, Any]
+    ) -> Any:
+        # Пропускаем команду /start
+        if event.text and event.text.startswith('/start'):
+            return await handler(event, data)
+            
+        # Проверяем подписку
+        if not await check_sub(event.from_user.id):
+            await event.answer(
+                "🛑 Секретарь работает только для своих.\n"
+                f"Подпишись на канал {CHANNEL_ID}, чтобы получить доступ.",
+                reply_markup=get_sub_keyboard()
+            )
+            return
+            
+        return await handler(event, data)
+
+# Регистрируем middleware
+router.message.middleware(ForceSubMiddleware())
+dp.include_router(router)
 
 # === ХЭНДЛЕРЫ ===
-
 @router.message(Command("start"))
 async def cmd_start(message: Message):
     if not await check_sub(message.from_user.id):
@@ -103,14 +112,12 @@ async def callback_check_sub(callback: CallbackQuery):
     else:
         await callback.answer("❌ Ты еще не подписался!", show_alert=True)
 
-# ПАРСЕР И БЫСТРОЕ ДОБАВЛЕНИЕ ЗАДАЧ
 @router.message(F.text & ~F.text.startswith('/'))
 async def add_task(message: Message):
     text = message.text
     deadline = None
     today = datetime.now().date()
     
-    # Примитивный парсинг текста без ИИ
     if re.search(r'\bзавтра\b', text.lower()):
         deadline = today + timedelta(days=1)
         text = re.sub(r'\bзавтра\b', '', text, flags=re.IGNORECASE).strip()
@@ -118,7 +125,6 @@ async def add_task(message: Message):
         deadline = today
         text = re.sub(r'\bсегодня\b', '', text, flags=re.IGNORECASE).strip()
     
-    # Сохраняем в БД
     async with aiosqlite.connect('secretary.db') as db:
         cursor = await db.execute(
             "INSERT INTO tasks (user_id, task_text, deadline) VALUES (?, ?, ?)",
@@ -127,48 +133,31 @@ async def add_task(message: Message):
         task_id = cursor.lastrowid
         await db.commit()
 
-    # Клавиатура под задачей
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Сделано", callback_data=f"done_{task_id}"),
          InlineKeyboardButton(text="➡️ На завтра", callback_data=f"tmrw_{task_id}")]
     ])
     
     date_str = deadline.strftime("%d.%m.%Y") if deadline else "Без срока (Инбокс)"
-    await message.answer(
-        f"📝 <b>Задача добавлена:</b> {text}\n📅 <b>Срок:</b> {date_str}", 
-        parse_mode="HTML", 
-        reply_markup=kb
-    )
+    await message.answer(f"📝 <b>Задача добавлена:</b> {text}\n📅 <b>Срок:</b> {date_str}", parse_mode="HTML", reply_markup=kb)
 
-# ОБРАБОТКА КНОПОК ЗАДАЧИ
 @router.callback_query(F.data.startswith("done_"))
 async def complete_task(callback: CallbackQuery):
     task_id = int(callback.data.split("_")[1])
     async with aiosqlite.connect('secretary.db') as db:
         await db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
         await db.commit()
-    
-    # Зачеркиваем текст задачи
-    await callback.message.edit_text(
-        f"<s>{callback.message.html_text}</s>\n\n✅ <b>Выполнено!</b>", 
-        parse_mode="HTML"
-    )
+    await callback.message.edit_text(f"<s>{callback.message.html_text}</s>\n\n✅ <b>Выполнено!</b>", parse_mode="HTML")
 
 @router.callback_query(F.data.startswith("tmrw_"))
 async def postpone_task(callback: CallbackQuery):
     task_id = int(callback.data.split("_")[1])
     tmrw = (datetime.now() + timedelta(days=1)).date()
-    
     async with aiosqlite.connect('secretary.db') as db:
         await db.execute("UPDATE tasks SET deadline = ? WHERE id = ?", (tmrw, task_id))
         await db.commit()
-        
-    await callback.message.edit_text(
-        f"{callback.message.html_text}\n\n➡️ <i>Перенесено на завтра</i>", 
-        parse_mode="HTML"
-    )
+    await callback.message.edit_text(f"{callback.message.html_text}\n\n➡️ <i>Перенесено на завтра</i>", parse_mode="HTML")
 
-# ПЛАН НА СЕГОДНЯ
 @router.message(Command("plan"))
 async def show_plan(message: Message):
     today = datetime.now().date()
@@ -186,19 +175,32 @@ async def show_plan(message: Message):
     msg = "📋 <b>Твой план на сегодня:</b>\n\n"
     for i, task in enumerate(tasks, 1):
         msg += f"{i}. {task[1]}\n"
-        
     await message.answer(msg, parse_mode="HTML")
 
-# === ЗАПУСК ===
-async def main():
+
+# === ЗАПУСК БОТА (Фоновая задача) ===
+async def start_bot():
     await init_db()
     print("🚀 Бот-секретарь успешно запущен!")
-    # Удаляем вебхуки на всякий случай, чтобы polling работал нормально
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
+# === ЗАПУСК WEB-СЕРВЕРА (Для Render) ===
+async def health_check(request):
+    return web.Response(text="Bot is running! All good.")
+
+async def on_startup(app):
+    # Запускаем бота как фоновую задачу при старте веб-сервера
+    asyncio.create_task(start_bot())
+
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        print("Бот остановлен.")
+    # Настраиваем простенький сервер
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    app.on_startup.append(on_startup)
+    
+    # Render передает порт в переменной окружения PORT. По дефолту 10000.
+    port = int(os.environ.get("PORT", 10000))
+    
+    # Запускаем сервер (а он за собой потянет бота)
+    web.run_app(app, host="0.0.0.0", port=port)
